@@ -70,6 +70,20 @@ class redis extends handler {
     protected $timeout;
 
     /**
+     * @var int $maxlockswaiting Maximum number of locks that a single session can queue concurrently.
+     *
+     * A value of 0 means disabled.
+     */
+    protected $maxlockswaiting = 0;
+
+
+    /**
+     * @var bool $waiting Is this transaction currently waiting for a lock.
+     *
+     */
+    protected $waiting = false;
+
+    /**
      * Create new instance of handler.
      */
     public function __construct() {
@@ -112,6 +126,10 @@ class redis extends handler {
         $this->lockexpire = $CFG->sessiontimeout;
         if (isset($CFG->session_redis_lock_expire)) {
             $this->lockexpire = (int)$CFG->session_redis_lock_expire;
+        }
+
+        if (!empty($CFG->session_redis_max_locks_waiting)) {
+            $this->maxlockswaiting = $CFG->session_redis_max_locks_waiting;
         }
     }
 
@@ -345,6 +363,7 @@ class redis extends handler {
      */
     protected function lock_session($id) {
         $lockkey = $id.".lock";
+        $lockwaitkey = $id.".wait";
 
         $haslock = isset($this->locks[$id]) && $this->time() < $this->locks[$id];
         $startlocktime = $this->time();
@@ -356,6 +375,24 @@ class redis extends handler {
         while (!$haslock) {
             $haslock = $this->connection->setnx($lockkey, '1');
             if (!$haslock) {
+
+                // Could not obtain lock as one already exists for this session, check waiting threshold if this
+                // transcation has not already incremented the wait counter.
+                if ($this->maxlockswaiting > 0 && $this->waiting == false) {
+                    $lockswaiting = $this->connection->get($lockwaitkey);
+                    if ($lockswaiting && $lockswaiting >= $this->maxlockswaiting) {
+                        error_log('Cannot obtain session lock for sid: '.$id.
+                            '. The number of waiting requests exceeded '.$this->maxlockswaiting.'.');
+                        $errortext = 'We have detected some unusual traffic for your session. Please retry again in a few minutes.';
+                        throw new exception($errortext);
+                    }
+                    // Set waiting and incremenet wait counter.
+                    $this->waiting = true;
+                    $this->connection->incr($lockwaitkey);
+                    // Set/reset expiry each time lock is incremented (expiry should prevent any indefinate locking).
+                    $this->connection->expire($lockwaitkey, $this->lockexpire);
+                }
+
                 usleep(rand(100000, 1000000));
                 if ($this->time() > $startlocktime + $this->acquiretimeout) {
                     // This is a fatal error, better inform users.
@@ -363,11 +400,21 @@ class redis extends handler {
                     // should close session immediately after access control checks.
                     error_log('Cannot obtain session lock for sid: '.$id.' within '.$this->acquiretimeout.
                             '. It is likely another page has a long session lock, or the session lock was never released.');
-                    throw new exception("Unable to obtain session lock");
+                    $errortext = 'Another request is still processing. Please retry in a few minutes.';
+                    throw new exception($errortext);
                 }
             } else {
                 $this->locks[$id] = $this->time() + $this->lockexpire;
                 $this->connection->expire($lockkey, $this->lockexpire);
+                if ($this->maxlockswaiting > 0) {
+                    $lockswaiting = $this->connection->get($lockwaitkey);
+                    if ($lockswaiting && $lockswaiting > 0) {
+                        // Only decrement wait value if it redis has a value greater than zero.
+                        $this->connection->decr($lockwaitkey);
+                    }
+                    // Request no longer waiting on a lock.
+                    $this->waiting = false;
+                }
                 return true;
             }
         }
