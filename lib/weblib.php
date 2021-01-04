@@ -2101,7 +2101,7 @@ function extract_draft_file_urls_from_text($text, $forcehttps = false, $contexti
 
     // Filename matching magic based on file_rewrite_urls_to_pluginfile().
     if (is_null($filename)) {
-        $filename = '[^\'\",&<>|`\s:\\\\]+';
+        $filename = '[^\'\",&<>|`\s:\\\\\?]+';
     }
     $urlstring .= "\/(?<filename>{$filename})/";
 
